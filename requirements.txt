@@ -1,0 +1,8 @@
+gunicorn==23.0.0
+Flask
+psycopg2-binary
+flask-cors
+python-dotenv
+inference_sdk
+requests
+werkzeug
