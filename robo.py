@@ -16,6 +16,8 @@ except Exception:
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Flutter calls
+# Limit upload size (10 MB)
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 # Make Flask aware of Railway proxy so scheme/host are correct
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
@@ -24,10 +26,12 @@ ROBOFLOW_API_URL = os.getenv(
     "ROBOFLOW_API_URL",
     "https://detect.roboflow.com/infer/workflows/masid-nert8/detect-count-and-visualize"
 )
-ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "eWs6KSOlnWifknc0nP1U")  # <-- set this on Railway!
+# IMPORTANT: set this in Railway → Variables; default is a placeholder
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "REPLACE_ME")
 
 # -------- Storage for processed images --------
-PROCESSED_FOLDER = os.getenv("PROCESSED_FOLDER", "processed")
+# On Railway, /tmp is a safe writable location
+PROCESSED_FOLDER = os.getenv("PROCESSED_FOLDER", "/tmp/processed")
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 app.config["PROCESSED_FOLDER"] = PROCESSED_FOLDER
 
@@ -42,10 +46,8 @@ def home():
 
 @app.get("/api/health")
 def health():
-    # quick connectivity check to roboflow (optional, not fatal)
-    status = "ok"
-    if ROBOFLOW_API_KEY == "eWs6KSOlnWifknc0nP1U":
-        status = "missing_roboflow_key"
+    # quick configuration check
+    status = "ok" if ROBOFLOW_API_KEY not in (None, "", "REPLACE_ME") else "missing_roboflow_key"
     return jsonify({"status": status}), 200
 
 @app.get("/processed/<path:filename>")
@@ -57,7 +59,7 @@ def detect_image():
     # ---- validations
     if "image" not in request.files:
         return jsonify({"error": "No image file provided"}), 400
-    if ROBOFLOW_API_KEY in (None, "", "eWs6KSOlnWifknc0nP1U"):
+    if ROBOFLOW_API_KEY in (None, "", "REPLACE_ME"):
         return jsonify({"error": "Server misconfigured: set ROBOFLOW_API_KEY"}), 500
 
     image_file = request.files["image"]
@@ -96,7 +98,6 @@ def detect_image():
 
     if rf_resp.status_code != 200:
         # Return Roboflow message to help debugging
-        msg = None
         try:
             msg = rf_resp.json()
         except Exception:
@@ -182,4 +183,3 @@ def detect_image():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
