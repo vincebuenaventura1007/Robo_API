@@ -44,7 +44,7 @@ def home():
 def health():
     # quick connectivity check to roboflow (optional, not fatal)
     status = "ok"
-    if ROBOFLOW_API_KEY == "REPLACE_ME":
+    if ROBOFLOW_API_KEY == "eWs6KSOlnWifknc0nP1U":
         status = "missing_roboflow_key"
     return jsonify({"status": status}), 200
 
@@ -57,7 +57,7 @@ def detect_image():
     # ---- validations
     if "image" not in request.files:
         return jsonify({"error": "No image file provided"}), 400
-    if ROBOFLOW_API_KEY in (None, "", "REPLACE_ME"):
+    if ROBOFLOW_API_KEY in (None, "", "eWs6KSOlnWifknc0nP1U"):
         return jsonify({"error": "Server misconfigured: set ROBOFLOW_API_KEY"}), 500
 
     image_file = request.files["image"]
@@ -182,3 +182,4 @@ def detect_image():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
