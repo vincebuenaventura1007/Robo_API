@@ -2,56 +2,82 @@ import sys
 import os
 import base64
 import requests
+from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Fix Unicode issues for Windows terminals
-sys.stdout.reconfigure(encoding="utf-8")
+# -------- Console Unicode (Windows) --------
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for Flutter API calls
+CORS(app)  # Enable CORS for Flutter calls
+# Make Flask aware of Railway proxy so scheme/host are correct
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-# Roboflow API Configuration
-ROBOFLOW_API_URL = "https://detect.roboflow.com/infer/workflows/masid-nert8/detect-count-and-visualize"
-ROBOFLOW_API_KEY = "eWs6KSOlnWifknc0nP1U"
+# -------- Roboflow API Configuration --------
+ROBOFLOW_API_URL = os.getenv(
+    "ROBOFLOW_API_URL",
+    "https://detect.roboflow.com/infer/workflows/masid-nert8/detect-count-and-visualize"
+)
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "eWs6KSOlnWifknc0nP1U")  # <-- set this on Railway!
 
-# Allowed image formats
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
-
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-# We only need to store processed images on disk now
-PROCESSED_FOLDER = "processed"
+# -------- Storage for processed images --------
+PROCESSED_FOLDER = os.getenv("PROCESSED_FOLDER", "processed")
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 app.config["PROCESSED_FOLDER"] = PROCESSED_FOLDER
 
-@app.route("/", methods=["GET"])
+# -------- File validation --------
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+@app.get("/")
 def home():
     return jsonify({"message": "Flask Roboflow API is running!"}), 200
 
-@app.route("/api/detect", methods=["POST"])
+@app.get("/api/health")
+def health():
+    # quick connectivity check to roboflow (optional, not fatal)
+    status = "ok"
+    if ROBOFLOW_API_KEY == "REPLACE_ME":
+        status = "missing_roboflow_key"
+    return jsonify({"status": status}), 200
+
+@app.get("/processed/<path:filename>")
+def serve_processed(filename):
+    return send_from_directory(app.config["PROCESSED_FOLDER"], filename)
+
+@app.post("/api/detect")
 def detect_image():
+    # ---- validations
     if "image" not in request.files:
         return jsonify({"error": "No image file provided"}), 400
+    if ROBOFLOW_API_KEY in (None, "", "REPLACE_ME"):
+        return jsonify({"error": "Server misconfigured: set ROBOFLOW_API_KEY"}), 500
 
     image_file = request.files["image"]
-
-    # Check if the file format is allowed
+    if image_file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
     if not allowed_file(image_file.filename):
-        return jsonify({"error": "Unsupported file format. Please upload a PNG or JPG image."}), 400
+        return jsonify({"error": "Unsupported file format. Use PNG/JPG."}), 400
 
+    # Optional: return base64 in response? (default true for compatibility)
+    include_b64 = (request.args.get("include_base64", "true").lower() != "false")
+
+    # ---- read file to memory
     filename = secure_filename(image_file.filename)
-    
-    # Read file bytes directly from memory instead of saving to disk first
     try:
         file_bytes = image_file.read()
         base64_image = base64.b64encode(file_bytes).decode("utf-8")
     except Exception as e:
-        return jsonify({"error": f"Failed to process image: {e}"}), 500
+        return jsonify({"error": f"Failed to read image: {e}"}), 500
 
-    # Send request to Roboflow API
+    # ---- call Roboflow workflow
     payload = {
         "api_key": ROBOFLOW_API_KEY,
         "inputs": {
@@ -59,74 +85,100 @@ def detect_image():
         },
     }
 
-    response = requests.post(ROBOFLOW_API_URL, json=payload, timeout=10)
-    
-    if response.status_code != 200:
-        return jsonify({"error": "Failed to process image"}), 500
-
     try:
-        data = response.json()
+        rf_resp = requests.post(
+            ROBOFLOW_API_URL,
+            json=payload,
+            timeout=(10, 60),  # 10s connect, 60s read
+        )
+    except requests.RequestException as e:
+        return jsonify({"error": f"Roboflow request failed: {e}"}), 502
 
-        # Extract processed image Base64
-        processed_image_base64 = None
-        if "outputs" in data and isinstance(data["outputs"], list) and len(data["outputs"]) > 0:
-            first_output = data["outputs"][0]
-            if "output_image" in first_output and isinstance(first_output["output_image"], dict):
-                processed_image_base64 = first_output["output_image"].get("value", None)
+    if rf_resp.status_code != 200:
+        # Return Roboflow message to help debugging
+        msg = None
+        try:
+            msg = rf_resp.json()
+        except Exception:
+            msg = rf_resp.text[:500]
+        return jsonify({"error": "Roboflow error", "status": rf_resp.status_code, "message": msg}), 502
 
-        if not processed_image_base64:
-            return jsonify({"error": "Processed image not found"}), 500
-
-        # Save the processed image locally
-        processed_filename = "processed_" + filename
-        processed_image_path = os.path.join(app.config["PROCESSED_FOLDER"], processed_filename)
-        with open(processed_image_path, "wb") as img_file:
-            img_file.write(base64.b64decode(processed_image_base64))
-
-        # Extract predictions safely
+    # ---- parse Roboflow response
+    try:
+        data = rf_resp.json()  # expect { outputs: [ { output_image: {...}, predictions: {...} } ] }
         outputs = data.get("outputs", [])
         if not outputs or not isinstance(outputs, list):
-            return jsonify({"error": "Unexpected response format"}), 500
+            return jsonify({"error": "Unexpected Roboflow response: outputs missing"}), 502
 
-        first_output = outputs[0] if outputs else {}
-        predictions_data = first_output.get("predictions", {})
+        first_output = outputs[0]
 
-        predictions = predictions_data.get("predictions", [])
+        # Output image (base64) from workflow
+        processed_image_base64 = None
+        out_img = first_output.get("output_image")
+        if isinstance(out_img, dict):
+            processed_image_base64 = out_img.get("value")
 
-        # Count occurrences of each class
+        # Predictions may be nested: predictions: { predictions: [...] }
+        predictions_block = first_output.get("predictions", {})
+        predictions = []
+        if isinstance(predictions_block, dict):
+            predictions = predictions_block.get("predictions", [])
+        elif isinstance(predictions_block, list):
+            # in case the workflow returns a list directly
+            predictions = predictions_block
+
+        # Count per class + uniq list for convenience
         class_counts = {}
-        for obj in predictions:
+        for obj in predictions or []:
             if isinstance(obj, dict):
-                class_name = obj.get("class", "Unknown")
-                class_counts[class_name] = class_counts.get(class_name, 0) + 1
+                cls = obj.get("class", "Unknown")
+                class_counts[cls] = class_counts.get(cls, 0) + 1
 
-        # Prepare formatted result
-        if len(class_counts) == 1:
-            detected_class = list(class_counts.keys())[0]
-            count = class_counts[detected_class]
-            formatted_result = f"{count} {detected_class}"
+        detected_ingredients = sorted(list(class_counts.keys()))
+        details = [{"class": c, "count": n} for c, n in class_counts.items()]
+        total_ingredients = sum(class_counts.values())
+
+        # ---- save processed image (if provided)
+        processed_filename = f"processed_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{filename}"
+        if processed_image_base64:
+            try:
+                with open(os.path.join(app.config["PROCESSED_FOLDER"], processed_filename), "wb") as out:
+                    out.write(base64.b64decode(processed_image_base64))
+            except Exception as e:
+                return jsonify({"error": f"Failed to write processed image: {e}"}), 500
         else:
-            formatted_result = {
-                "ingredients": sum(class_counts.values()),
-                "details": [{"count": count, "class": c} for c, count in class_counts.items()],
-            }
+            # fallback: store the original if workflow didn't return an image
+            try:
+                with open(os.path.join(app.config["PROCESSED_FOLDER"], processed_filename), "wb") as out:
+                    out.write(file_bytes)
+            except Exception as e:
+                return jsonify({"error": f"Failed to write fallback image: {e}"}), 500
 
-        # Generate processed image URL
-        processed_image_url = f"http://{request.host}/processed/{processed_filename}"
+        # ---- build absolute URL with correct scheme behind Railway proxy
+        scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
+        processed_image_url = f"{scheme}://{request.host}/processed/{processed_filename}"
 
-        return jsonify({
-            "result": formatted_result,
+        # ---- compatibility 'result' field (string for single class, dict otherwise)
+        if len(class_counts) == 1:
+            only = next(iter(class_counts))
+            result = f"{class_counts[only]} {only}"
+        else:
+            result = {"ingredients": total_ingredients, "details": details}
+
+        resp_payload = {
             "processed_image_url": processed_image_url,
-            "processed_image_base64": processed_image_base64
-        }), 200
+            "detected_ingredients": detected_ingredients,
+            "ingredients": total_ingredients,
+            "details": details,
+            "result": result,
+        }
+        if include_b64:
+            resp_payload["processed_image_base64"] = processed_image_base64
+
+        return jsonify(resp_payload), 200
 
     except Exception as e:
-        return jsonify({"error": f"Error processing API response: {e}"}), 500
-
-@app.route("/processed/<filename>", methods=["GET"])
-def serve_processed_image(filename):
-    """Serve the processed image to Flutter."""
-    return send_from_directory(app.config["PROCESSED_FOLDER"], filename)
+        return jsonify({"error": f"Error processing Roboflow response: {e}"}), 500
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
