@@ -24,7 +24,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 # -------- Roboflow API Configuration --------
 ROBOFLOW_API_URL = os.getenv(
     "ROBOFLOW_API_URL",
-    "https://detect.roboflow.com/infer/workflows/masid-nert8/detect-count-and-visualize"
+    "https://detect.roboflow.com/infer/workflows/masid3/detect-count-and-visualize"
 )
 # IMPORTANT: set this in Railway → Variables; default is a placeholder
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "REPLACE_ME")
@@ -183,3 +183,4 @@ def detect_image():
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
