@@ -1,15 +1,12 @@
 import sys
 import os
 import base64
+import requests
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
-
-# NEW: Roboflow SDK
-from inference_sdk import InferenceHTTPClient
-from requests import RequestException
 
 # -------- Console Unicode (Windows) --------
 try:
@@ -24,14 +21,13 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 # Make Flask aware of Railway proxy so scheme/host are correct
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-# -------- Roboflow / Workflow Configuration (env-driven) --------
-ROBOFLOW_API_KEY   = os.getenv("ROBOFLOW_API_KEY", "REPLACE_ME")
-ROBOFLOW_API_BASE  = os.getenv("ROBOFLOW_API_BASE", "https://serverless.roboflow.com")
-ROBOFLOW_WORKSPACE = os.getenv("ROBOFLOW_WORKSPACE", "masid3")
-ROBOFLOW_WORKFLOW  = os.getenv("ROBOFLOW_WORKFLOW", "detect-count-and-visualize")
-
-# Initialize SDK client (will raise if URL is malformed)
-rf_client = InferenceHTTPClient(api_url=ROBOFLOW_API_BASE, api_key=ROBOFLOW_API_KEY)
+# -------- Roboflow API Configuration --------
+ROBOFLOW_API_URL = os.getenv(
+    "ROBOFLOW_API_URL",
+    "https://detect.roboflow.com/infer/workflows/masid3/detect-count-and-visualize"
+)
+# IMPORTANT: set this in Railway → Variables; default is a placeholder
+ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "REPLACE_ME")
 
 # -------- Storage for processed images --------
 # On Railway, /tmp is a safe writable location
@@ -52,12 +48,7 @@ def home():
 def health():
     # quick configuration check
     status = "ok" if ROBOFLOW_API_KEY not in (None, "", "REPLACE_ME") else "missing_roboflow_key"
-    return jsonify({
-        "status": status,
-        "api_base": ROBOFLOW_API_BASE,
-        "workspace": ROBOFLOW_WORKSPACE,
-        "workflow": ROBOFLOW_WORKFLOW
-    }), 200
+    return jsonify({"status": status}), 200
 
 @app.get("/processed/<path:filename>")
 def serve_processed(filename):
@@ -84,79 +75,62 @@ def detect_image():
     filename = secure_filename(image_file.filename)
     try:
         file_bytes = image_file.read()
+        base64_image = base64.b64encode(file_bytes).decode("utf-8")
     except Exception as e:
         return jsonify({"error": f"Failed to read image: {e}"}), 500
 
-    # Write a temporary upload file because the SDK expects a path/bytes-like file reference.
-    # Using a temp file keeps memory low and is robust across SDK versions.
-    temp_upload_path = os.path.join(
-        app.config["PROCESSED_FOLDER"],
-        f"upload_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{filename}"
-    )
-    try:
-        with open(temp_upload_path, "wb") as f:
-            f.write(file_bytes)
-    except Exception as e:
-        return jsonify({"error": f"Failed to persist upload: {e}"}), 500
+    # ---- call Roboflow workflow
+    payload = {
+        "api_key": ROBOFLOW_API_KEY,
+        "inputs": {
+            "image": {"type": "base64", "value": base64_image}
+        },
+    }
 
-    # ---- call Roboflow workflow via SDK
-    app.logger.info(
-        f"Running workflow via SDK: base={ROBOFLOW_API_BASE}, "
-        f"workspace={ROBOFLOW_WORKSPACE}, workflow={ROBOFLOW_WORKFLOW}"
-    )
     try:
-        # images expects a dict; we pass the local file path
-        rf_result = rf_client.run_workflow(
-            workspace_name=ROBOFLOW_WORKSPACE,
-            workflow_id=ROBOFLOW_WORKFLOW,
-            images={"image": temp_upload_path},
-            use_cache=True  # cache workflow definition ~15 min
+        rf_resp = requests.post(
+            ROBOFLOW_API_URL,
+            json=payload,
+            timeout=(10, 60),  # 10s connect, 60s read
         )
-    except Exception as e:
-        # SDK wraps network and API errors as generic Exceptions; surface message
-        try:
-            # Best effort: include class name for quicker triage
-            err_name = e.__class__.__name__
-            err_msg = f"{err_name}: {e}"
-        except Exception:
-            err_msg = str(e)
-        return jsonify({"error": "Roboflow error (SDK)", "message": err_msg}), 502
-    finally:
-        # remove temp upload file
-        try:
-            os.remove(temp_upload_path)
-        except Exception:
-            pass
+    except requests.RequestException as e:
+        return jsonify({"error": f"Roboflow request failed: {e}"}), 502
 
-    # ---- parse Roboflow response (SDK returns a dict like the REST one)
+    if rf_resp.status_code != 200:
+        # Return Roboflow message to help debugging
+        try:
+            msg = rf_resp.json()
+        except Exception:
+            msg = rf_resp.text[:500]
+        return jsonify({"error": "Roboflow error", "status": rf_resp.status_code, "message": msg}), 502
+
+    # ---- parse Roboflow response
     try:
-        # Expected structure: { "outputs": [ { "output_image": <dict|str>, "predictions": <dict|list> } ] }
-        outputs = rf_result.get("outputs", [])
+        data = rf_resp.json()  # expect { outputs: [ { output_image: {...}, predictions: {...} } ] }
+        outputs = data.get("outputs", [])
         if not outputs or not isinstance(outputs, list):
             return jsonify({"error": "Unexpected Roboflow response: outputs missing"}), 502
 
         first_output = outputs[0]
 
-        # Output image may be a dict with 'value' or a raw base64 string
+        # Output image (base64) from workflow
         processed_image_base64 = None
         out_img = first_output.get("output_image")
         if isinstance(out_img, dict):
             processed_image_base64 = out_img.get("value")
-        elif isinstance(out_img, str) and out_img.strip():
-            processed_image_base64 = out_img.strip()
 
-        # Predictions may be dict { predictions: [...] } or a list directly
+        # Predictions may be nested: predictions: { predictions: [...] }
         predictions_block = first_output.get("predictions", {})
+        predictions = []
         if isinstance(predictions_block, dict):
-            predictions = predictions_block.get("predictions", []) or []
+            predictions = predictions_block.get("predictions", [])
         elif isinstance(predictions_block, list):
+            # in case the workflow returns a list directly
             predictions = predictions_block
-        else:
-            predictions = []
 
-        # Count per class
+        # Count per class + uniq list for convenience
         class_counts = {}
-        for obj in predictions:
+        for obj in predictions or []:
             if isinstance(obj, dict):
                 cls = obj.get("class", "Unknown")
                 class_counts[cls] = class_counts.get(cls, 0) + 1
@@ -165,20 +139,21 @@ def detect_image():
         details = [{"class": c, "count": n} for c, n in class_counts.items()]
         total_ingredients = sum(class_counts.values())
 
-        # ---- save processed image (if provided); else keep original
+        # ---- save processed image (if provided)
         processed_filename = f"processed_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{filename}"
-        to_write_bytes = None
-        if processed_image_base64 and processed_image_base64.strip():
+        if processed_image_base64:
             try:
-                to_write_bytes = base64.b64decode(processed_image_base64)
-            except Exception:
-                to_write_bytes = None  # fall back to original below
-
-        try:
-            with open(os.path.join(app.config["PROCESSED_FOLDER"], processed_filename), "wb") as out:
-                out.write(to_write_bytes if to_write_bytes is not None else file_bytes)
-        except Exception as e:
-            return jsonify({"error": f"Failed to write processed image: {e}"}), 500
+                with open(os.path.join(app.config["PROCESSED_FOLDER"], processed_filename), "wb") as out:
+                    out.write(base64.b64decode(processed_image_base64))
+            except Exception as e:
+                return jsonify({"error": f"Failed to write processed image: {e}"}), 500
+        else:
+            # fallback: store the original if workflow didn't return an image
+            try:
+                with open(os.path.join(app.config["PROCESSED_FOLDER"], processed_filename), "wb") as out:
+                    out.write(file_bytes)
+            except Exception as e:
+                return jsonify({"error": f"Failed to write fallback image: {e}"}), 500
 
         # ---- build absolute URL with correct scheme behind Railway proxy
         scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
