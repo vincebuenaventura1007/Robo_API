@@ -68,7 +68,7 @@ def detect_image():
     if not allowed_file(image_file.filename):
         return jsonify({"error": "Unsupported file format. Use PNG/JPG."}), 400
 
-    # Optional: return base64 in response? default=true for compatibility
+    # Optional: return base64 in response? (default true for compatibility)
     include_b64 = (request.args.get("include_base64", "true").lower() != "false")
 
     # ---- read file to memory
@@ -79,7 +79,7 @@ def detect_image():
     except Exception as e:
         return jsonify({"error": f"Failed to read image: {e}"}), 500
 
-    # ---- call Roboflow workflow (Hosted API)
+    # ---- call Roboflow workflow
     payload = {
         "api_key": ROBOFLOW_API_KEY,
         "inputs": {
@@ -92,7 +92,6 @@ def detect_image():
             ROBOFLOW_API_URL,
             json=payload,
             timeout=(10, 60),  # 10s connect, 60s read
-            headers={"Content-Type": "application/json"}  # explicit
         )
     except requests.RequestException as e:
         return jsonify({"error": f"Roboflow request failed: {e}"}), 502
@@ -126,6 +125,7 @@ def detect_image():
         if isinstance(predictions_block, dict):
             predictions = predictions_block.get("predictions", [])
         elif isinstance(predictions_block, list):
+            # in case the workflow returns a list directly
             predictions = predictions_block
 
         # Count per class + uniq list for convenience
